@@ -532,8 +532,16 @@ class ForegroundLocationsWriter:
         if n == 0:
             self._buffer = [data]
             return
-        self._array.resize((self._written + n,))
-        self._array[self._written:self._written + n] = data[:n]
+        if self._written == 0:
+            # Growing an empty in-memory array via resize hits a divide-by-zero (SIGFPE) in
+            # blosc2 4.0.0 on some platforms; build the first chunk at its final size instead.
+            # The freshly allocated chunks are fully overwritten here, so nothing is lost.
+            self._array = blosc2.zeros(shape=(n,), dtype=np.uint64, chunks=(self.chunk_size,),
+                                       blocks=(self.block_size,), cparams=_cparams(self._clevel, self._nthreads))
+            self._array[0:n] = data[:n]
+        else:
+            self._array.resize((self._written + n,))
+            self._array[self._written:self._written + n] = data[:n]
         self._written += n
         rest = data[n:]
         self._buffer = [rest] if len(rest) else []
