@@ -1,0 +1,167 @@
+Bug: ForegroundLocationsWriter crashes the parent process (SIGFPE) when building
+the foreground sampling-location store
+==============================================================================
+
+File:   nnunetv2/training/dataloading/foreground_locations.py
+Method: ForegroundLocationsWriter._flush()
+Trigger: nnUNetv2_extract_sampling_locations -d 12 -c 3d_fullres
+         (and any dataset whose first flush crosses the chunk threshold)
+Crash:  "Floating point exception (core dumped)"  ->  SIGFPE (exit code 136)
+
+
+1. SYMPTOM (what looked wrong)
+------------------------------
+Running the extraction command died after ~5 of 141 cases, buried under a wall of
+`BrokenPipeError: [Errno 32] Broken pipe` tracebacks coming out of several
+`SpawnPoolWorker` processes, plus a resource_tracker warning about 6 leaked
+semaphores.
+
+The BrokenPipeError tracebacks were a distraction. They are a *secondary* effect:
+a pool worker only gets a broken pipe when it tries to send a result back to a
+parent that is no longer alive. They describe the *consequence* of the crash, not
+the cause.
+
+The real first line, interleaved with the progress bar, was:
+
+    Extracting foreground sampling locations: 4%|...| 5/141 [00:02<00:41, 3.27it/s]
+    Floating point exception (core dumped)
+
+"Floating point exception (core dumped)" is the shell's message for a process
+killed by SIGFPE (signal 8). On x86, SIGFPE is almost always an integer
+divide-by-zero (or integer overflow) in compiled code, not a real floating-point
+problem. The parent process was killed by SIGFPE; every pool worker then died
+with BrokenPipeError because its result pipe led nowhere.
+
+So the question became: which C-level division in the parent can hit zero?
+
+
+2. WHAT THE CODE IS TRYING TO DO
+--------------------------------
+`ForegroundLocationsWriter` streams per-case foreground voxel coordinates into a
+single blosc2 array built **in memory**, then writes it to disk once in
+`finalize()`. To avoid holding every coordinate in a raw numpy buffer, it:
+
+  * starts from an empty in-memory array:  blosc2.zeros(shape=(0,), ...)
+  * accumulates coordinates in a Python list (`self._buffer`)
+  * once the buffer holds a whole multiple of the chunk size, calls `_flush()`,
+    which grows the array with `self._array.resize(...)` and copies the new
+    coordinates in.
+
+The very first flush is the special case: at that point `self._written == 0`, so
+`_flush()` calls `self._array.resize((0 + n,))` — i.e. it **grows an array that
+is still empty (size 0)**.
+
+
+3. ROOT CAUSE (what was actually wrong)
+---------------------------------------
+blosc2 4.0.0 (the version installed in the `nnunet` env) crashes with SIGFPE on
+this machine when you call `resize()` to grow an **empty** in-memory array. The
+divide-by-zero is inside blosc2's C core, on the path that recomputes the chunk
+layout for a 0-length array.
+
+This was isolated with a minimal repro (no nnU-Net code, pure blosc2):
+
+    data = np.random.randint(0, 146800640, size=1_048_576, dtype=np.uint64)
+
+    # A: build at final size, assign, serialise                 ->  OK
+    arr = blosc2.zeros(shape=(1_048_576,), dtype=np.uint64,
+                       chunks=(32768,), blocks=(512,), cparams={...ZSTD clevel9...})
+    arr[:] = data
+    arr.to_cframe()                                            # works
+
+    # B: build empty, then resize to grow                        ->  SIGFPE (136)
+    arr = blosc2.zeros(shape=(0,), dtype=np.uint64,
+                       chunks=(32768,), blocks=(512,), cparams={...ZSTD clevel9...})
+    arr.resize((32768,))
+    arr[0:32768] = data[:32768]                                # crashes here
+
+The crash is **not** sensitive to the compression settings: ZSTD/LZ4, clevel 1/9,
+nthreads 1/8, with or without the SHUFFLE/BYTEDELTA filters — every variant that
+did `resize()` from an empty array crashed, and every variant that allocated at
+the target size up front worked. The single distinguishing factor was
+"resize() starting from shape (0,)".
+
+A follow-up check confirmed that resize() from a **non-zero** size is fine on this
+machine (32768 -> 65536 -> 98304 all succeeded). So the defect is specifically
+the empty-array case, which is exactly the first flush of the writer.
+
+Note the crash is platform/version dependent: the same code path is what writes
+the `_image.b2nd` / `_seg.b2nd` files during preprocessing, and those runs
+completed fine here — they allocate at their final size. Only the writer's
+grow-from-empty pattern hits the blosc2 bug. It also could not be fixed by
+upgrading blosc2, because PyPI was unreachable from this machine at the time.
+
+
+4. THE FIX
+----------
+In `_flush()`, special-case the first flush. When nothing has been written yet
+(`self._written == 0`), do **not** `resize()` the empty array. Instead allocate a
+fresh in-memory array already at the target size and write into it. From the
+second flush onward (`self._written > 0`), keep the original `resize()` path,
+which is safe.
+
+    -        self._array.resize((self._written + n,))
+    -        self._array[self._written:self._written + n] = data[:n]
+    +        if self._written == 0:
+    +            # Growing an empty in-memory array via resize hits a divide-by-zero
+    +            # (SIGFPE) in blosc2 4.0.0 on some platforms; build the first chunk
+    +            # at its final size instead. The freshly allocated chunks are fully
+    +            # overwritten here, so nothing is lost.
+    +            self._array = blosc2.zeros(shape=(n,), dtype=np.uint64,
+    +                                       chunks=(self.chunk_size,),
+    +                                       blocks=(self.block_size,),
+    +                                       cparams=_cparams(self._clevel, self._nthreads))
+    +            self._array[0:n] = data[:n]
+    +        else:
+    +            self._array.resize((self._written + n,))
+    +            self._array[self._written:self._written + n] = data[:n]
+         self._written += n
+
+This is the minimal change: one branch added, the steady-state behaviour and the
+output format are byte-for-byte unchanged (the in-memory `direct` allocation path
+produces the same cframe as the resized path).
+
+
+5. WHY IT WORKS
+---------------
+  * The crashing operation was `resize()` growing a size-0 in-memory blosc2 array.
+    The first flush is the *only* place that does that. After the first flush the
+    array is non-empty, so every subsequent `resize()` is the safe kind (verified
+    directly on this machine).
+  * Replacing that one call with "allocate at the target size, then assign" uses
+    the blosc2 code path that is known to work here (it is the same path the
+    preprocessing step uses to write its .b2nd files, and it was proven by the
+    minimal repro in section 3).
+  * Nothing is lost: the freshly allocated array's chunks are immediately and
+    completely overwritten by `self._array[0:n] = data[:n]` before anything is
+    read back, and `self._written` / `self._total` / the CSR index bookkeeping
+    are untouched.
+  * The `n == 0` early-return, the `rest = data[n:]` tail handling, and the
+    `_spill_to_disk()` memory cap all behave exactly as before.
+
+
+6. HOW IT WAS VERIFIED
+----------------------
+  * `nnUNetv2_extract_sampling_locations -d 12 ... -c 3d_fullres` now runs to
+    141/141 (previously died at ~5/141) and exits 0.
+  * The store is complete: `fg_sampling/` contains base.npy, class_id.npy,
+    count.npy, indptr.npy, locations.b2nd, shape.npy and meta.json;
+    `has_foreground_locations()` is True. meta reports 29,116,052 coordinates
+    over 141 cases, class_keys = [1].
+  * Read-back through the *same* reader the training dataloader uses
+    (`ForegroundLocations`): 300 random samples across 15 cases, 0 landed off the
+    foreground; per-case store counts are the standard ~1% subsample of the true
+    foreground voxel count (e.g. case _0001: 166,825 stored vs 16,682,438 true);
+    `case_shape()` matches the segmentation shape.
+
+
+7. SCOPE / CAVEATS
+------------------
+  * The change is confined to the writer's first flush; it is a no-op for any
+    blosc2 build where resize-from-empty already works, so it is safe to keep.
+  * The same writer is used for every dataset, so this also unblocks the
+    equivalent run for Dataset011.
+  * It does not touch the dataloader / reader, the store layout, or the output
+    format — downstream (training) is unaffected beyond "the store now exists".
+  * The underlying defect is in blosc2 4.0.0's empty-array resize on this
+    platform; if blosc2 is later upgraded/fixed, this branch remains harmless.
